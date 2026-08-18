@@ -8,7 +8,7 @@ toc: false
 Ce site rassemble les documents d'architecture produits pour faciliter la reprise
 et la maintenance des outils développés.
 
-## Documents disponibles
+## Documents disponibles 
 
 ::: {.grid}
 
