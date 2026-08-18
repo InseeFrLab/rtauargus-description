@@ -8,24 +8,17 @@ format:
   html:
     toc: true
     toc-depth: 3
-    toc-location: left
     number-sections: true
     code-fold: true
     code-tools: true
     theme: sandstone
     fig-width: 9
-    embed-resources: true
 execute:
   echo: false
   warning: false
   message: false
 ---
 
-```{r}
-#| label: setup
-#| include: false
-knitr::opts_chunk$set(echo = FALSE)
-```
 
 ::: {.callout-note}
 ## À propos de ce document
@@ -733,7 +726,7 @@ Le graphe présenté ici peut être recalculé après toute modification du code
 méthode la plus fiable utilise `codetools::findGlobals()` sur le namespace chargé,
 ce qui capture les appels réels plutôt que des motifs textuels.
 
-```{r}
+```r
 #| eval: false
 #| echo: true
 library(codetools)

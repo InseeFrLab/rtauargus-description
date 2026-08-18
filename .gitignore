@@ -51,3 +51,7 @@ rsconnect/
 # html files
 *.html
 
+# deploy quarto
+_site/*
+.quarto/*
+

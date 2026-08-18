@@ -1,0 +1,44 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - "*.qmd"          # tout ce qui est à la racine
+    - "docs/**/*.qmd"  # et dans un futur sous-dossier docs/
+    - "!brouillons/"   # sauf ce dossier (exemple d'exclusion)
+
+website:
+  title: "Documentation technique"
+  # site-url: https://<compte>.github.io/<repo>/   # à renseigner pour les liens absolus
+  search:
+    location: sidebar
+    type: textbox
+  navbar:
+    left:
+      - href: index.qmd
+        text: Accueil
+    right:
+      - icon: github
+        href: https://github.com/InseeFrLab/rtauargus
+        aria-label: Dépôt rtauargus
+  sidebar:
+    style: docked
+    contents:
+      - href: index.qmd
+        text: Accueil
+      - section: "rtauargus"
+        contents:
+          - rtauargus_architecture.qmd
+      # - section: "Autre sujet"
+      #   contents:
+      #     - docs/autre_document.qmd
+  page-footer:
+    left: "Documentation interne"
+    right: "Généré avec [Quarto](https://quarto.org)"
+
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: sandstone
+    code-tools: true

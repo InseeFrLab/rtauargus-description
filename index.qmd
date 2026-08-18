@@ -1,0 +1,31 @@
+---
+title: "Documentation technique"
+subtitle: "Notes d'architecture et guides de reprise"
+number-sections: false
+toc: false
+---
+
+Ce site rassemble les documents d'architecture produits pour faciliter la reprise
+et la maintenance des outils développés.
+
+## Documents disponibles
+
+::: {.grid}
+
+::: {.g-col-12 .g-col-md-6}
+### [rtauargus — Carte du code](rtauargus_architecture.qmd)
+
+Architecture interne du package `rtauargus` (interface R pour τ-Argus) :
+découpage en blocs fonctionnels, graphe d'appels hiérarchisé, points d'attention
+pour un futur mainteneur.
+
+*Analyse portant sur la version 1.3.5.*
+:::
+
+:::
+
+## Ajouter un document
+
+Déposer un fichier `.qmd` à la racine ou dans `docs/`, puis le référencer dans la
+section `sidebar` du fichier `_quarto.yml`. Le rendu et la publication sont
+automatiques à chaque `push` sur `main`.
