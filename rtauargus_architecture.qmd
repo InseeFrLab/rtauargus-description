@@ -1,0 +1,785 @@
+---
+title: "rtauargus — Carte du code"
+subtitle: "Guide d'architecture à destination des mainteneurs"
+author: "Document généré par Claude Opus 5 à partir du dossier `R/` du dépôt InseeFrLab/rtauargus"
+date: today
+lang: fr
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    theme: sandstone
+    fig-width: 9
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+::: {.callout-note}
+## À propos de ce document
+
+Ce document décrit l'**architecture interne** du package `rtauargus`
+(version 1.3.5, dossier `R/`, 41 fichiers, ~11 200 lignes). Il ne remplace pas
+la documentation utilisateur ([inseefrlab.github.io/rtauargus](https://inseefrlab.github.io/rtauargus/))
+ni les vignettes : il vise à répondre à la question *« qui appelle qui, et pourquoi ? »*
+pour quelqu'un qui doit reprendre la maintenance.
+
+L'analyse a été faite par lecture systématique des définitions de fonctions et de
+leurs corps, y compris les appels indirects via `do.call()` et `param_function()`,
+que les outils automatiques manquent généralement. La @sec-regenerer donne le code
+permettant de régénérer le graphe d'appels après modification du code.
+:::
+
+# Vue d'ensemble
+
+## Le principe de fonctionnement
+
+`rtauargus` n'implémente **aucun algorithme de suppression** : c'est un pilote de
+τ-Argus. Tout le package converge vers un unique point de contact avec le logiciel
+externe, `run_arb()`, qui exécute `TauArgus.exe` en ligne de commande. Le reste du
+code sert à :
+
+1. **fabriquer les fichiers d'entrée** attendus par τ-Argus (`.tab`, `.rda`, `.hst`,
+   `.arb`, `.hrc`) ;
+2. **orchestrer** un ou plusieurs appels successifs à τ-Argus ;
+3. **réimporter et remettre en forme** les résultats dans R.
+
+Cette contrainte explique la forme récurrente du code : chaque fonction « chapeau »
+(`tab_rtauargus`, `micro_rtauargus`) est une séquence
+*métadonnées → batch → exécution → import*.
+
+## Les quatre blocs fonctionnels
+
+Le découpage proposé dans la commande initiale se vérifie dans le code, avec une
+nuance : les blocs ne sont **pas au même niveau**. Trois d'entre eux sont des
+chaînes de traitement, le quatrième (analyse de la demande) est un module d'analyse
+combinatoire **totalement disjoint** du reste — il ne partage aucune fonction avec
+les autres blocs.
+
+| # | Bloc | Point d'entrée | Fichiers `R/` | Statut |
+|---|------|----------------|---------------|--------|
+| A | Production de données tabulées | `tabulate_micro_data()` | `tabul_group_fun.R` | Autonome, ne touche pas τ-Argus |
+| B | Analyse automatique de la demande | `analyse_metadata()`, `format_template()` | 9 fichiers | Autonome, `experimental` |
+| C | Protection de données tabulées | `tab_rtauargus()`, `tab_multi_manager()` | ~15 fichiers | **Cœur du package**, voie recommandée |
+| D | Protection depuis les microdonnées | `micro_rtauargus()`, `rtauargus_plus()` | 4 fichiers | Historique, plus privilégié |
+| — | Socle transverse | `run_arb()`, `util.R`, `options.R`, `hrc.R` | 8 fichiers | Partagé par C et D |
+
+## Carte générale
+
+```{mermaid}
+%%| fig-cap: "Vue macroscopique. Les flèches pleines sont des appels de fonction, les pointillées des enchaînements d'usage (l'utilisateur passe la sortie de l'une à l'autre)."
+flowchart TB
+  subgraph A["A — Tabulation"]
+    direction TB
+    TMD["tabulate_micro_data()"]
+  end
+
+  subgraph B["B — Analyse de la demande (experimental)"]
+    direction TB
+    FT["format_template()"]
+    AM["analyse_metadata()"]
+    FT -.-> AM
+  end
+
+  subgraph C["C — Protection de tableaux"]
+    direction TB
+    TMM["tab_multi_manager()"]
+    TR["tab_rtauargus()"]
+    TR4["tab_rtauargus4()"]
+    TR2["tab_rtauargus2()"]
+    TMM --> TR2 --> TR
+    TR --> TR4
+    TR4 --> TMM
+  end
+
+  subgraph D["D — Protection depuis microdonnées (historique)"]
+    direction TB
+    RP["rtauargus_plus()"]
+    MR["micro_rtauargus()"]
+    RP --> MR
+  end
+
+  subgraph S["Socle — interface τ-Argus"]
+    direction TB
+    RDA["tab_rda() / micro_asc_rda()"]
+    ARB["tab_arb() / micro_arb()"]
+    RUN["run_arb()"]
+    IMP["import()"]
+    HRC["write_hrc() / write_hrc2()"]
+    RUN --> IMP
+  end
+
+  MICRO[("microdonnées")] --> TMD
+  MICRO --> MR
+  TMD -.-> TR
+  TMD -.-> TMM
+  AM -.-> TMM
+  HRC -.-> TR
+  HRC -.-> TMM
+
+  TR --> RDA
+  TR --> ARB
+  TR --> RUN
+  MR --> RDA
+  MR --> ARB
+  MR --> RUN
+  RUN ==> TAU{{"TauArgus.exe"}}
+
+  style TAU fill:#f6d6ad,stroke:#b5761f
+  style C stroke-width:3px
+```
+
+## Hiérarchie d'appel condensée
+
+Les cinq niveaux qui structurent le bloc C, du plus haut au plus bas :
+
+```
+  N0  utilisateur
+  N1  tab_multi_manager()        gestion multi-tableaux liés, itérations
+  N2  tab_rtauargus2()           wrapper : fixe les défauts pour N1
+  N3  tab_rtauargus()            traitement d'un tableau, un aller-retour τ-Argus
+  N3' tab_rtauargus4()           dérivation : réduction de dimension (4-5 dims)
+  N4  tab_rda() | tab_arb() | run_arb()      écriture des fichiers + exécution
+  N5  write_rda_tab(), creer_hst(), arb_contents(), import(), normPath2()...
+```
+
+# Bloc A — Production de données tabulées {#sec-bloca}
+
+## Objectif
+
+Produire, à partir de microdonnées, un tableau **contenant toutes les marges**
+nécessaires à τ-Argus, avec les statistiques dont les règles de secret primaire
+ont besoin : effectif, total pondéré et **valeur du premier contributeur** (`max`),
+indispensable aux règles de dominance.
+
+Tout tient dans un seul fichier, `tabul_group_fun.R` (181 lignes), et une seule
+fonction est exportée.
+
+## Fonctions
+
+| Fonction | Exportée | Rôle |
+|---|---|---|
+| `tabulate_micro_data()` | ✅ | Point d'entrée. Gère les variables hiérarchiques (`hrc_vars`) |
+| `tabul_group_all_margins()` | ❌ | Empile les tableaux de tous les croisements |
+| `all_croisements()` | ❌ | Énumère les sous-ensembles de variables (`combn` de toutes tailles + `""`) |
+| `tabul_group_dt()` | ❌ | Agrégation `data.table` sur un croisement donné |
+
+## Enchaînement
+
+```{mermaid}
+flowchart LR
+  TMD["tabulate_micro_data()"] --> TGAM["tabul_group_all_margins()"]
+  TGAM --> AC["all_croisements()"]
+  TGAM --> TGD["tabul_group_dt()"]
+  TGD --> SS["summary_spec()<br/><i>closure locale</i>"]
+```
+
+## Points de compréhension
+
+- **Gestion des hiérarchies.** Si `hrc_vars` est fourni (ex.
+  `list(ACTIVITY = c("A10","A21"))`), `tabulate_micro_data()` fait un `expand.grid()`
+  sur les niveaux, tabule **une fois par combinaison de niveaux**, renomme les
+  colonnes de niveau vers le nom de la variable hiérarchique, puis `rbindlist()` +
+  `unique()`. C'est ce qui produit un tableau « à plat » où une même colonne
+  contient des modalités de plusieurs niveaux d'agrégation.
+- **Colonnes produites.** `nb_obs`, puis pour chaque `resp_var` un couple
+  `<var>_tot` (somme pondérée) et `<var>_max` (maximum non pondéré). Attention :
+  `max` est calculé **sans pondération** alors que `tot` l'est avec — cohérent avec
+  l'usage (le plus gros contributeur) mais à garder en tête.
+- **Coût.** Le nombre de croisements est en `2^k`. Sur beaucoup de variables
+  catégorielles, la fonction devient rapidement le goulot d'étranglement.
+- L'en-tête du fichier porte encore un commentaire *« Ce code devra être adapté
+  aux cas d'usages réels »* : c'est un module qui a été promu depuis un script.
+
+# Bloc B — Analyse automatique de la demande {#sec-blocb}
+
+## Objectif
+
+Étant donné une **description des tableaux à publier** (métadonnées : nom, champ,
+indicateur, variables de croisement, fichiers `.hrc` associés), déterminer
+automatiquement quels tableaux sont **liés entre eux** et doivent donc être
+protégés ensemble — c'est-à-dire quels *clusters* passer à `tab_multi_manager()`.
+
+C'est le module présenté au poster NTTS 2025. Il est marqué
+`lifecycle::badge("experimental")` et **ne partage aucune fonction** avec les blocs
+C et D : c'est un module d'analyse de graphe et de combinatoire pur, sans I/O
+τ-Argus.
+
+## Deux points d'entrée distincts
+
+| Fonction | Entrée | Sortie |
+|---|---|---|
+| `format_template()` | Un « template » de cellules publiées (une ligne = une cellule diffusée) | Métadonnées au format attendu par `analyse_metadata()` + modalités des variables hiérarchiques |
+| `analyse_metadata()` | Un data.frame de métadonnées **au format large** | Affectation de chaque tableau à un cluster |
+
+`format_template()` est donc un **amont facultatif** : il permet de partir de ce
+que le métier fournit réellement (une liste de cellules) plutôt que d'une
+description formelle des tableaux.
+
+## Le pipeline de `analyse_metadata()`
+
+C'est une chaîne linéaire de sept étapes, chacune dans son propre fichier. C'est le
+sous-système le plus lisible du package, et le seul où le découpage
+« un fichier = une étape » est appliqué strictement.
+
+```{mermaid}
+%%| fig-cap: "Pipeline de analyse_metadata(). Chaque étape produit l'entrée de la suivante ; avec verbose = TRUE, tous les intermédiaires sont retournés."
+flowchart TB
+  AM["analyse_metadata()"]
+  AM --> W["wide_to_long()<br/><small>métadonnées large → long</small>"]
+  W --> IH{"df_eq_indicator<br/>fourni ?"}
+  IH -- non --> IH1["identify_hrc()<br/><small>renomme les variables<br/>selon leur hiérarchie</small>"]
+  IH -- oui --> IH2["identify_hrc_with_eq()<br/><small>+ équations entre indicateurs</small>"]
+  IH1 --> SC["split_in_clusters()"]
+  IH2 --> SC
+  SC --> CE["create_edges()<br/><small>relations d'inclusion</small>"]
+  CE --> GTN["grp_tab_names()<br/><small>tables de traduction</small>"]
+  GTN --> GTC["grp_tab_in_cluster()<br/><small>regroupe les tableaux<br/>indépendants</small>"]
+  GTC --> TTT["tab_to_treat()"]
+  TTT --> DR["dataframe_result()"]
+  DR --> OUT[["cluster_id par tableau"]]
+
+  SC --> SD["split_dataframe()"]
+  IH2 --> BS["build_spanning_based_on_hrc_indicator()"]
+  IH2 --> RT["regroup_tables()"]
+```
+
+## Fonctions du bloc B
+
+| Fichier | Fonction | Exportée | Rôle |
+|---|---|---|---|
+| `analyse_metadata.R` | `analyse_metadata()` | ✅ | Orchestrateur des 7 étapes |
+| `wide_to_long.R` | `wide_to_long()` | ❌ | Passe les colonnes `spanning_1..n` en format long |
+| `identify_hrc.R` | `identify_hrc()` | ✅ | Renomme les variables selon leur hiérarchie (deux variables liées par une hiérarchie reçoivent le même nom) |
+| `identify_hrc_with_eq.R` | `identify_hrc_with_eq()` | ✅ | Variante gérant les équations entre indicateurs (ex. CA = CA_France + CA_export) |
+| | `build_spanning_based_on_hrc_indicator()` | ❌ | Sous-étape |
+| | `regroup_tables()` | ❌ | Sous-étape |
+| `split_in_clusters.R` | `split_in_clusters()` | ✅ | Découpe en clusters de tableaux liés |
+| | `split_dataframe()` | ✅ | Découpe selon une variable |
+| `create_edges.R` | `create_edges()` | ✅ | Construit les arêtes du graphe d'inclusion (utilise `igraph`) |
+| `grp_tab_names.R` | `grp_tab_names()` | ✅ | Tables de traduction pour le regroupement |
+| `grp_tab_in_cluster.R` | `grp_tab_in_cluster()` | ✅ | Regroupe les tableaux inclus les uns dans les autres |
+| `tab_to_treat.R` | `tab_to_treat()` | ✅ | Aplatit la structure imbriquée |
+| | `dataframe_result()` | ✅ | Assemble le data.frame final |
+| `format_template.R` | `format_template()` | ✅ | Déduit les tableaux à partir d'un template de cellules |
+| | `get_combinations()` | ❌ | Combinaisons de variables de croisement |
+| | `contains_non_total()` | ❌ | Teste la présence de non-totaux |
+| | `filter_on_marginal_of_spanning_var()` | ❌ | Filtre sur les marges |
+
+## Points de compréhension
+
+- **Contrat d'entrée strict.** `analyse_metadata()` commence par une closure locale
+  `check_column_names()` qui impose les colonnes
+  `table_name, field, hrc_field, indicator, hrc_indicator` et exige que chaque
+  `spanning_i` ait son `hrc_spanning_i`. Toute évolution du format doit être
+  répercutée là **et** dans `wide_to_long()`.
+- **`verbose = TRUE`** retourne les huit résultats intermédiaires nommés d'après
+  les étapes : c'est l'outil de débogage naturel de ce bloc, et c'est aussi ce qui
+  rend le pipeline testable étape par étape.
+- Les huit fonctions du pipeline sont **exportées** alors qu'elles sont des étapes
+  internes. Elles apparaissent d'ailleurs dans la rubrique « Others » du
+  `_pkgdown.yml`. C'est un choix cohérent avec le `verbose = TRUE`, mais cela fige
+  leur signature comme API publique.
+
+# Bloc C — Protection de données tabulées {#sec-blocc}
+
+C'est le cœur du package et de loin le sous-système le plus volumineux
+(~5 000 lignes). Il se lit sur **trois étages**.
+
+## Étage 1 — `tab_rtauargus()` : un tableau, un appel à τ-Argus
+
+`tab_rtauargus()` (`tab_rtauargus.R`) enchaîne mécaniquement quatre phases,
+matérialisées par des blocs commentés `## 0.` à `## 3.` dans le code :
+
+```{mermaid}
+flowchart TB
+  TR["tab_rtauargus()"]
+  TR --> P0["0. Contrôles de cohérence<br/><small>colonnes présentes, longueur de totcode…</small>"]
+  P0 --> UNI["uniformize_labels()<br/><small>si unif_labels = TRUE</small>"]
+  UNI --> P1["1. tab_rda()<br/><small>écrit .tab, .rda, .hst</small>"]
+  P1 --> P2["2. tab_arb()<br/><small>écrit le batch .arb</small>"]
+  P2 --> P3["3. run_arb()<br/><small>exécute TauArgus.exe</small>"]
+  P3 --> P4["read.csv + merge<br/>rev_var_pour_tau_argus()"]
+  P4 --> RES[["tabular + colonne Status"]]
+  P4 -.-> SUM["summarize_secret()<br/><small>optionnel</small>"]
+
+  TR -.->|"si 4-5 dims<br/>et split_tab = TRUE"| TR4["tab_rtauargus4()"]
+```
+
+**Mécanisme de passage des paramètres.** C'est le point le plus déroutant du code.
+`tab_rtauargus()` capture `...` dans `.dots`, puis pour chaque fonction appelée :
+
+```r
+param_tab_rda <- param_function(tab_rda, .dots)   # filtre .dots sur les formals de tab_rda
+param_tab_rda$tabular <- tabular                  # puis surcharge explicitement
+input <- do.call(tab_rda, param_tab_rda)
+```
+
+`param_function()` (dans `util.R`) est donc **la clé de voûte** du système : elle
+permet à l'utilisateur de passer n'importe quel argument de `tab_rda()`,
+`tab_arb()`, `run_arb()` ou même `system()` directement à `tab_rtauargus()`.
+Corollaire pour le mainteneur : **les appels sont invisibles à l'analyse statique**
+(`do.call(tab_rda, ...)` et non `tab_rda(...)`), et une faute de frappe dans un nom
+d'argument passé via `...` est **silencieusement ignorée** plutôt que signalée.
+
+Le retour dépend de `output_type` :
+
+- `output_type = 4` (défaut) : le tableau d'origine + colonne `Status`
+  (`A`/`B`/`C` secret primaire, `D` secret secondaire, `V` cellule valide) ;
+- sinon : la sortie brute de τ-Argus.
+
+## Étage 2 — `tab_multi_manager()` : plusieurs tableaux liés
+
+`tab_multi_manager()` (`multitable.R`, 560 lignes) résout le problème des
+**cellules communes** : quand deux tableaux partagent des cellules, poser un secret
+sur l'une doit se propager à l'autre. L'algorithme est un point fixe itératif :
+
+```{mermaid}
+flowchart TB
+  START["tab_multi_manager()"] --> INIT["Initialisation<br/><small>fusion des tableaux en une<br/>« table majeure » avec indicatrices T_&lt;tab&gt;</small>"]
+  INIT --> TODO{"todolist<br/>non vide ?"}
+  TODO -- non --> FIN["Reconstruction de la liste<br/>de tableaux + summarize_secret()"]
+  TODO -- oui --> PICK["Prend le 1er tableau"]
+  PICK --> CALL["do.call('tab_rtauargus2', params)"]
+  CALL --> MAJ["Met à jour is_secret_&lt;n&gt;<br/>dans la table majeure"]
+  MAJ --> DIFF["Repère les cellules communes<br/>dont le statut a changé"]
+  DIFF --> ADD["Réinjecte les tableaux<br/>impactés dans todolist"]
+  ADD --> TODO
+
+  CALL -.->|journal.txt| LOG["journal_add_line()<br/>journal_add_break_line()"]
+```
+
+Éléments à connaître :
+
+- **`func_to_call <- "tab_rtauargus2"`** est codé en dur ligne 136. C'est
+  l'unique raison d'être de `tab_rtauargus2()` : fixer des valeurs par défaut
+  adaptées à l'itération (`safety_rules = "MAN(0)"`, `output_type = 4`,
+  `verbose = FALSE`, `unif_labels = TRUE`, `split_tab` selon la dimension).
+- **La « table majeure »** est la structure centrale : tous les tableaux sont
+  fusionnés en un seul data.frame, complété avec les totaux pour les variables
+  absentes, plus une colonne booléenne `T_<nom_tableau>` par tableau d'origine.
+  L'appartenance d'une cellule à plusieurs tableaux se lit alors directement.
+- **`ip_start` / `ip_end`.** L'intervalle de protection n'est appliqué qu'à la
+  première itération de chaque tableau (`ip_start`), les suivantes utilisent
+  `ip_end` (0 par défaut). De même, la désactivation singleton/multi-singleton de
+  la méthode modulaire est appliquée à partir de la 2ᵉ itération.
+- **Garde-fou** : `num_iter_max` (10 par défaut) borne les itérations par tableau.
+- **Traçabilité** : un `journal.txt` est écrit dans `dir_name` avec les compteurs
+  par itération et la liste des cellules communes touchées. C'est le premier
+  endroit à regarder pour diagnostiquer un comportement inattendu.
+- Sortie : la liste des tableaux d'origine augmentée d'une colonne `is_secret_<n>`
+  par itération ; la dernière est le statut final.
+
+## Étage 3 — Réduction de dimension (tableaux à 4 ou 5 variables)
+
+τ-Argus gère mal les tableaux au-delà de 3 dimensions. Le sous-système `sp_*`
+(préfixe « split ») contourne le problème en **fusionnant des variables** pour
+ramener le tableau à 3 dimensions, puis en traitant la collection de tableaux
+résultante comme des tableaux liés.
+
+C'est le sous-système le plus lourd (~2 700 lignes sur 8 fichiers) et le seul à
+contenir de la vraie logique d'optimisation combinatoire.
+
+```{mermaid}
+flowchart TB
+  TR4["tab_rtauargus4()"]
+  TR4 --> RD["reduce_dims()"]
+  TR4 --> TMM["tab_multi_manager()"]
+  TR4 --> RF["restore_format()"]
+
+  RD --> VTM["var_to_merge()"]
+  RD --> CS["chose_sep()"]
+  RD --> F43["from_4_to_3()"]
+  RD --> F53["from_5_to_3()"]
+  RD --> SPF["sp_format()"]
+  RD --> ST["split_tab()"]
+
+  VTM --> VTMF["var_to_merge_fragment()"]
+  VTM --> GEN["generate_a_pair()<br/>generate_two_pairs()<br/>generate_a_triplet()"]
+  VTMF --> LT["length_tabs()"]
+  LT --> LT4["length_tabs_4()"]
+  LT --> LT54["length_tabs_5_4_var()"]
+  LT --> LT53["length_tabs_5_3_var()"]
+  LT4 --> IMPH["import_hierarchy()"]
+  LT54 --> IMPH
+  LT53 --> IMPH
+
+  F53 --> F43
+  F53 --> NN["nb_nodes()"]
+  F43 --> CVTM["chose_var_to_merge()"]
+  F43 --> C0["from_4_to_3_case_0_hr()"]
+  F43 --> C1["from_4_to_3_case_1_hr()"]
+  F43 --> C2["from_4_to_3_case_2_hr()"]
+  C2 --> C1 --> C0
+  C0 --> WH2["write_hrc2()"]
+
+  CVTM --> CVPH["choose_var_priority_hierarchical()"]
+  CVTM --> CVPNH["choose_var_priority_non_hierarchical()"]
+
+  RF --> S53["separer5_3()"]
+  RF --> S43["separer4_3()"]
+
+  style TMM fill:#ffe9c9
+```
+
+Logique de lecture :
+
+1. **Choisir quelles variables fusionner** — `var_to_merge()` et sa cascade
+   `length_tabs*()` estiment *a priori* la taille et le nombre des tableaux
+   produits par chaque fusion candidate. La stratégie est pilotée par
+   `nb_tab_option` : `"min"` (minimiser le nombre de tableaux), `"max"`, ou
+   `"smart"` (minimiser sous contrainte de `limit` lignes, 14 700 par défaut).
+2. **Fusionner** — `from_4_to_3()` traite trois cas selon le nombre de variables
+   hiérarchiques concernées (0, 1 ou 2), avec un chaînage en cascade :
+   `case_2_hr` → `case_1_hr` → `case_0_hr`. `from_5_to_3()` applique deux
+   réductions successives. Les nouvelles hiérarchies sont écrites via
+   `write_hrc2()`.
+3. **Protéger** — la collection de tableaux à 3 dimensions est passée à
+   `tab_multi_manager()`, qui les traite comme des tableaux liés.
+4. **Reconstruire** — `restore_format()` (`separer4_3()`, `separer5_3()`) sépare
+   les modalités concaténées pour retrouver le tableau d'origine à 4 ou 5 dimensions.
+
+::: {.callout-warning}
+## La récursion croisée du bloc C
+
+Il existe un cycle d'appel qu'il faut avoir en tête avant toute refonte :
+
+`tab_rtauargus()` → `tab_rtauargus4()` → `tab_multi_manager()` → `tab_rtauargus2()`
+→ `tab_rtauargus()`
+
+Il ne boucle pas indéfiniment parce que `reduce_dims()` ramène les tableaux à
+3 dimensions, et que `tab_rtauargus()` ne redirige vers `tab_rtauargus4()` que si
+`length(explanatory_vars) %in% c(4,5)`. Cette terminaison repose donc entièrement
+sur une garde numérique, pas sur une structure. Toute modification de
+`reduce_dims()` doit préserver l'invariant « sortie à 3 dimensions ».
+:::
+
+## Fonctions utilitaires du bloc C
+
+| Fichier | Fonction | Exportée | Rôle |
+|---|---|---|---|
+| `summarize_secret.R` | `summarize_secret()` | ✅ | Compte les cellules par statut (primaire / secondaire / publiée) et leur poids en valeur. Récursive sur une liste de tableaux |
+| `writehrc.R` | `write_hrc2()` | ✅ | Écrit un `.hrc` à partir d'une **table de correspondance** (une colonne par niveau) |
+| `hrc.R` | `write_hrc()` | ✅ | Écrit un `.hrc` à partir de **microdonnées** (version historique) |
+| `util.R` | `uniformize_labels()` | ❌ | Complète les modalités par `*` pour qu'elles aient toutes la même longueur, contrainte de τ-Argus. Traite aussi les fichiers `.hrc` associés |
+| | `rev_var_pour_tau_argus()` | ❌ | Opération inverse, appliquée au retour |
+
+::: {.callout-tip}
+## `write_hrc()` vs `write_hrc2()`
+
+Les deux produisent un fichier `.hrc` mais partent de sources différentes et
+n'ont **aucun code commun** : `write_hrc()` (dans `hrc.R`, avec ses 9 fonctions
+auxiliaires `sublevels()`, `hrc_list()`, `prof_list()`, `check_seq_prof()`…) déduit
+la hiérarchie de microdonnées ; `write_hrc2()` (dans `writehrc.R`) lit une table de
+correspondance. C'est `write_hrc2()` qui est utilisée en interne par le
+sous-système `sp_*` et mise en avant dans la documentation.
+:::
+
+# Bloc D — Protection depuis les microdonnées {#sec-blocd}
+
+## Objectif et statut
+
+C'est la voie historique du package : τ-Argus tabule lui-même à partir d'un
+fichier de microdonnées à format fixe (`.asc`) et de ses métadonnées (`.rda`). Le
+`_pkgdown.yml` la décrit comme *« Original way to proceed but no longer the favored
+one »*, et le README recommande explicitement l'approche tabulaire.
+
+La structure est **rigoureusement parallèle** à celle du bloc C — c'est d'ailleurs
+la meilleure façon de la lire :
+
+| Rôle | Bloc C (tabulaire) | Bloc D (microdonnées) |
+|---|---|---|
+| Chapeau | `tab_rtauargus()` | `micro_rtauargus()` |
+| Métadonnées | `tab_rda()` | `micro_asc_rda()` |
+| Batch | `tab_arb()` | `micro_arb()` |
+| Exécution | `run_arb()` | `run_arb()` *(partagée)* |
+| Traitement par lots | `tab_multi_manager()` | `rtauargus_plus()` |
+
+```{mermaid}
+flowchart TB
+  RP["rtauargus_plus()<br/><small>découpe en groupes de grp_size croisements</small>"]
+  RP --> UV["used_var()"]
+  RP --> MR["micro_rtauargus()"]
+  MR --> MAR["micro_asc_rda()<br/><small>écrit .asc + .rda</small>"]
+  MR --> MA["micro_arb()<br/><small>écrit le batch .arb</small>"]
+  MR --> RUN["run_arb()"]
+  MAR --> NH["normalise_hrc()"]
+  MAR --> WR["write_rda()"]
+  MA --> AB["apriori_batch()"]
+  MA --> SS["specif_safety()"]
+  MA --> SW["suppr_writetable()"]
+```
+
+## Points de compréhension
+
+- **`rtauargus_plus()` n'est pas un `tab_multi_manager()` du pauvre.** Il ne gère
+  pas les liens entre tableaux : il contourne simplement la limite de 10 tabulations
+  simultanées de τ-Argus en découpant la demande en groupes de `grp_size`
+  croisements, et en ne passant à chaque groupe que les colonnes strictement
+  nécessaires (via `used_var()`). C'est une optimisation de performance, pas de
+  protection.
+- **`micro_rtauargus()` accepte deux formes d'entrée** : un data.frame (les
+  fichiers `.asc`/`.rda` sont alors créés) ou un chemin vers des fichiers `.asc`/`.rda`
+  existants.
+- Les messages d'erreur de ce bloc sont **en français non accentué**
+  (`"Incoherence parametres"`), contrairement au bloc C qui est en anglais. C'est
+  un marqueur fiable de l'ancienneté du code.
+
+# Le socle transverse {#sec-socle}
+
+## `run_arb()` : le point de contact unique
+
+`run_arb()` (`run_arb.R`, 404 lignes) est **la seule fonction du package qui lance
+τ-Argus**. Toute évolution de la compatibilité avec le logiciel passe par elle.
+
+Elle enchaîne :
+
+1. des vérifications préalables (existence de `TauArgus.exe`, des fichiers `.asc`/`.rda`,
+   des dossiers de sortie, des variables citées dans le batch) via `arb_contents()`
+   et `vars_micro_rda()` ;
+2. l'appel système proprement dit ;
+3. l'affichage du logbook via `display_console()` (tout si `verbose = TRUE`, les
+   erreurs seulement sinon) ;
+4. le réimport optionnel des résultats via `import()`.
+
+```{mermaid}
+flowchart LR
+  RUN["run_arb()"] --> AC["arb_contents()"]
+  AC --> SD["specif_decompose()"]
+  AC --> WD["write_decompose()"]
+  AC --> AD["apriori_decompose()"]
+  RUN --> VMR["vars_micro_rda()"]
+  RUN --> NP["normPath2()"]
+  RUN --> SYS{{"system(TauArgus.exe)"}}
+  RUN --> DC["display_console()"]
+  RUN --> IMP["import()"]
+  IMP --> AC
+  IMP --> RTO["read_ta_output()"]
+  RTO --> RFH["read_fixheader()"]
+  IMP --> MI["meta_import()"]
+```
+
+## `util.R` : les fonctions transverses
+
+| Fonction | Utilisée par | Rôle |
+|---|---|---|
+| `param_function()` | `tab_rtauargus`, `tab_rtauargus2`, `tab_multi_manager`, `micro_rtauargus`, `rtauargus_plus` | **Filtre `...` sur les formals d'une fonction cible.** Mécanisme central du passage d'arguments |
+| `normPath2()` | tous les écrivains de fichiers | Normalisation des chemins (séparateurs Windows attendus par τ-Argus) |
+| `uniformize_labels()` | `tab_rtauargus` | Uniformisation de la longueur des modalités |
+| `trans_var_pour_tau_argus()` / `rev_var_pour_tau_argus()` | via `uniformize_labels` | Padding / dépadding par `*` |
+| `df_param_defaut()` | `tab_rda`, `micro_asc_rda` | Résolution des paramètres par variable |
+| `used_var()` | `rtauargus_plus` | Variables strictement nécessaires à un jeu de croisements |
+| `cite()` | `tab_arb`, `micro_arb`, `options.R` | Mise entre guillemets pour la syntaxe batch |
+| `following_dup()` | `write_hrc` | Détection de doublons consécutifs |
+
+## Options du package
+
+`options.R` définit `op.rtauargus`, la liste des 15 options par défaut, appliquées
+par `.onLoad()` (`zzz.R`) **uniquement si elles ne sont pas déjà définies** — les
+réglages utilisateur préexistants sont préservés.
+
+Convention : `rtauargus.<argument>` fournit la valeur par défaut de l'argument
+`<argument>` de `micro_asc_rda()`, `tab_rda()`, `micro_arb()`, `tab_arb()` ou
+`run_arb()`. `df_op.rtauargus()` construit d'ailleurs la table de correspondance
+option → fonction **dynamiquement**, par introspection des `formals()` : ajouter une
+option suffit à la documenter, à condition que l'argument existe dans l'une de ces
+cinq fonctions.
+
+`rtauargus_options()` liste les options actives, `reset_rtauargus_options()` les
+réinitialise (toutes, ou celles nommées).
+
+# Récapitulatif : fichiers, fonctions, dépendances {#sec-recap}
+
+## Table de correspondance fichier → bloc
+
+| Fichier | Lignes | Bloc | Contenu principal |
+|---|---:|---|---|
+| `tabul_group_fun.R` | 181 | A | `tabulate_micro_data` |
+| `analyse_metadata.R` | 135 | B | orchestrateur |
+| `wide_to_long.R` | 43 | B | étape 1 |
+| `identify_hrc.R` | 71 | B | étape 2a |
+| `identify_hrc_with_eq.R` | 426 | B | étape 2b (équations) |
+| `split_in_clusters.R` | 137 | B | étape 3 |
+| `create_edges.R` | 112 | B | étape 4 |
+| `grp_tab_names.R` | 138 | B | étape 5 |
+| `grp_tab_in_cluster.R` | 106 | B | étape 6 |
+| `tab_to_treat.R` | 197 | B | étapes 7-8 |
+| `format_template.R` | 279 | B | amont facultatif |
+| `tab_rtauargus.R` | 474 | C | `tab_rtauargus`, `tab_rtauargus2` |
+| `multitable.R` | 560 | C | `tab_multi_manager` |
+| `sp_tab_rtauargus.R` | 147 | C | `tab_rtauargus4` |
+| `sp_reduce_dims.R` | 923 | C | `reduce_dims`, formatage |
+| `sp_var_to_merge.R` | 900 | C | choix des variables à fusionner |
+| `sp_from_4_to_3.R` | 295 | C | réduction 4→3 |
+| `sp_from_4_to_3_case_0_hr.R` | 226 | C | cas 0 hiérarchie |
+| `sp_from_4_to_3_case_1_hr.R` | 146 | C | cas 1 hiérarchie |
+| `sp_from_4_to_3_case_2_hr.R` | 154 | C | cas 2 hiérarchies |
+| `sp_from_5_to_3.R` | 329 | C | réduction 5→3 |
+| `sp_restore_format.R` | 192 | C | reconstruction |
+| `summarize_secret.R` | 125 | C | statistiques de secret |
+| `tab_rda.R` | 675 | C/socle | `.tab`, `.rda`, `.hst` |
+| `tab_arb.R` | 321 | C/socle | batch `.arb` tabulaire |
+| `micro_rtauargus.R` | 210 | D | chapeau microdonnées |
+| `rtauargus_plus.R` | 206 | D | traitement par lots |
+| `micro_asc_rda.R` | 442 | D | `.asc`, `.rda` |
+| `micro_arb.R` | 486 | D | batch `.arb` microdonnées |
+| `run_arb.R` | 404 | socle | exécution τ-Argus |
+| `arb_contents.R` | 167 | socle | lecture d'un `.arb` |
+| `import.R` | 241 | socle | réimport des sorties |
+| `hrc.R` | 461 | socle | `write_hrc` + normalisation |
+| `writehrc.R` | 554 | socle | `write_hrc2` |
+| `util.R` | 237 | socle | fonctions transverses |
+| `options.R` | 228 | socle | options du package |
+| `zzz.R` | 41 | socle | `.onLoad`, `.onAttach`, `.onUnload` |
+| `globals.R`, `data.R`, `rtauargus-package.R` | 241 | — | déclarations et documentation |
+
+## Fonctions les plus appelées
+
+Ce sont les points de fragilité : toute modification s'y propage largement.
+
+| Fonction | Nombre d'appelants internes |
+|---|---:|
+| `normPath2()` | 12 |
+| `param_function()` | 5 |
+| `nb_nodes()` | 4 |
+| `import_hierarchy()` | 4 |
+| `cite()` | 3 |
+| `run_arb()` | 2 (`tab_rtauargus`, `micro_rtauargus`) |
+| `summarize_secret()` | 2 (`tab_rtauargus`, `tab_multi_manager`) |
+| `uniformize_labels()` | 1 (`tab_rtauargus`) |
+
+# Points d'attention pour la reprise {#sec-attention}
+
+Ces observations sont factuelles, tirées du code tel qu'il est. Elles ne sont pas
+des bugs mais des choses qu'un nouveau mainteneur découvrira tôt ou tard, mieux
+vaut que ce soit tôt.
+
+## Duplication de fonctions entre `arb_contents.R` et `run_arb.R`
+
+Cinq fonctions internes sont définies **deux fois, à l'identique**, dans les deux
+fichiers : `specif_decompose()`, `write_decompose()`, `apriori_decompose()`,
+`rm_cmd()`, `unquote()`. Il n'y a pas de champ `Collate` dans le `DESCRIPTION`, donc
+les fichiers sont chargés dans l'ordre alphabétique : `arb_contents.R` d'abord,
+`run_arb.R` ensuite — **ce sont les définitions de `run_arb.R` qui gagnent**.
+Une correction appliquée à la copie de `arb_contents.R` n'aurait donc aucun effet.
+Les deux fichiers ont aussi des fins de ligne différentes (CRLF pour
+`arb_contents.R`, LF pour `run_arb.R`), ce qui suggère une copie manuelle ancienne.
+
+## Le passage d'arguments par `...` est silencieux
+
+`param_function()` filtre `...` sur les `formals()` de la fonction cible : un
+argument mal orthographié est **ignoré sans avertissement**. C'est la cause la plus
+probable des tickets du type « le paramètre X ne fait rien ». Un `warning` sur les
+éléments de `.dots` consommés par aucune fonction cible serait un ajout à faible
+coût et fort rendement.
+
+## Couverture de tests
+
+`tests/testthat/` contient six fichiers : `test_analyse_metadata.R`,
+`test_format_template.R`, `test_hrc.R`, `test_micro_arb.R`,
+`test_micro_asc_rda.R`, `test_util.R`.
+
+Autrement dit : le bloc B et le socle sont testés, mais **il n'y a aucun test
+automatisé sur `tab_rtauargus`, `tab_multi_manager` ni sur tout le sous-système
+`sp_*`** — soit ~5 000 lignes, c'est-à-dire le cœur du package. La raison est
+compréhensible (ces fonctions exigent `TauArgus.exe`), mais une partie est
+testable sans lui : `reduce_dims()`, `var_to_merge()`, `length_tabs()`,
+`restore_format()` sont des fonctions pures. Un jeu de tests sur la seule paire
+`reduce_dims()` / `restore_format()` (propriété d'aller-retour : on doit retrouver
+le tableau d'origine) couvrirait déjà une grande partie du risque.
+
+## Nomenclature hétérogène
+
+Trois conventions cohabitent, par strates historiques :
+
+- français non accentué : `chose_var_to_merge`, `creer_hst`, `imbrique`,
+  `separer4_3`, `normalise_hrc`, `vrai_tableau`, `table_majeure` ;
+- anglais : `split_in_clusters`, `identify_hrc`, `summarize_secret` ;
+- suffixes numériques d'API : `tab_rtauargus`, `tab_rtauargus2`, `tab_rtauargus4`
+  — qui ne désignent ni des versions ni une progression, mais respectivement
+  le cas général, un wrapper interne et le cas 4-5 dimensions. C'est probablement
+  le point de nommage le plus coûteux en compréhension.
+
+## Autres détails relevés
+
+- `multitable.R` lignes 143-144 : `params$suppress = suppress` est écrit deux fois
+  (sans conséquence).
+- `multitable.R` ligne 302 : l'appel à `uniformize_labels()` est commenté ; c'est
+  `tab_rtauargus()` qui s'en charge en aval, à chaque itération.
+- `tab_rtauargus.R` ligne 442 : `params$safety_rules = "MAN(0)"` avec en commentaire
+  la version paramétrée `paste0("MAN(",ip,")")` — le passage de `ip` se fait
+  ailleurs, via `params$ip`.
+- `sp_tab_rtauargus.R` : un `TODO` signale que les fichiers `.hrc` créés dans
+  `dir_name/hrc` ne sont jamais nettoyés.
+- `tab_rtauargus()` avec 4-5 dimensions et `split_tab = FALSE` émet un long message
+  d'avertissement mais poursuit ; c'est un défaut discutable pour une fonction dont
+  le résultat sera sous-optimal.
+
+# Régénérer le graphe d'appels {#sec-regenerer}
+
+Le graphe présenté ici peut être recalculé après toute modification du code. La
+méthode la plus fiable utilise `codetools::findGlobals()` sur le namespace chargé,
+ce qui capture les appels réels plutôt que des motifs textuels.
+
+```{r}
+#| eval: false
+#| echo: true
+library(codetools)
+
+ns   <- asNamespace("rtauargus")
+fns  <- Filter(function(x) is.function(get(x, envir = ns)),
+               ls(ns, all.names = TRUE))
+
+edges <- do.call(rbind, lapply(fns, function(f) {
+  g <- codetools::findGlobals(get(f, envir = ns), merge = FALSE)$functions
+  g <- intersect(g, setdiff(fns, f))
+  if (length(g)) data.frame(from = f, to = g) else NULL
+}))
+
+# Visualisation interactive
+library(visNetwork)
+visNetwork(
+  nodes = data.frame(id = unique(c(edges$from, edges$to)),
+                     label = unique(c(edges$from, edges$to))),
+  edges = edges
+) |>
+  visEdges(arrows = "to") |>
+  visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE)
+```
+
+::: {.callout-important}
+## Limite de la méthode automatique
+
+`findGlobals()` **ne voit pas** les appels indirects, qui sont pourtant les plus
+structurants ici :
+
+- `do.call(tab_rda, param_tab_rda)` dans `tab_rtauargus()` ;
+- `do.call("tab_rtauargus4", params_rt4)` dans `tab_rtauargus()` ;
+- `do.call(func_to_call, params)` dans `tab_multi_manager()`, où
+  `func_to_call <- "tab_rtauargus2"` ;
+- `do.call("tab_multi_manager", params_multi)` dans `tab_rtauargus4()` ;
+- `do.call(micro_asc_rda, ...)`, `do.call(micro_arb, ...)`, `do.call(run_arb, ...)`
+  dans `micro_rtauargus()` ;
+- `do.call(micro_rtauargus, ...)` dans `rtauargus_plus()`.
+
+Ces six arêtes sont exactement celles qui relient les étages entre eux. Il faut les
+ajouter à la main au graphe automatique, faute de quoi le package apparaît comme
+une collection de composants sans liens.
+:::
+
+---
+
+*Analyse portant sur `rtauargus` 1.3.5. Dépôt : <https://github.com/InseeFrLab/rtauargus> ·
+Documentation : <https://inseefrlab.github.io/rtauargus/>*
