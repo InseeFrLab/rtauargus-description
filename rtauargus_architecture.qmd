@@ -227,26 +227,75 @@ C'est une chaîne linéaire de sept étapes, chacune dans son propre fichier. C'
 sous-système le plus lisible du package, et le seul où le découpage
 « un fichier = une étape » est appliqué strictement.
 
-```{mermaid}
-%%| fig-cap: "Pipeline de analyse_metadata(). Chaque étape produit l'entrée de la suivante ; avec verbose = TRUE, tous les intermédiaires sont retournés."
-flowchart TB
-  AM["analyse_metadata()"]
-  AM --> W["wide_to_long()<br/><small>métadonnées large → long</small>"]
-  W --> IH{"df_eq_indicator<br/>fourni ?"}
-  IH -- non --> IH1["identify_hrc()<br/><small>renomme les variables<br/>selon leur hiérarchie</small>"]
-  IH -- oui --> IH2["identify_hrc_with_eq()<br/><small>+ équations entre indicateurs</small>"]
-  IH1 --> SC["split_in_clusters()"]
-  IH2 --> SC
-  SC --> CE["create_edges()<br/><small>relations d'inclusion</small>"]
-  CE --> GTN["grp_tab_names()<br/><small>tables de traduction</small>"]
-  GTN --> GTC["grp_tab_in_cluster()<br/><small>regroupe les tableaux<br/>indépendants</small>"]
-  GTC --> TTT["tab_to_treat()"]
-  TTT --> DR["dataframe_result()"]
-  DR --> OUT[["cluster_id par tableau"]]
+```{r}
+#| label: fig-analyse-metadata-flow
+#| fig-cap: "Pipeline de la fonction analyse_metadata()"
+#| echo: false
+#| warning: false
+#| fig-height: 10
 
-  SC --> SD["split_dataframe()"]
-  IH2 --> BS["build_spanning_based_on_hrc_indicator()"]
-  IH2 --> RT["regroup_tables()"]
+library(DiagrammeR)
+
+grViz("
+digraph analyse_metadata {
+
+  graph [rankdir = TB, fontsize = 11, fontname = Helvetica]
+  node  [shape = box, style = 'rounded,filled', fontname = Helvetica, fontsize = 10]
+  edge  [fontname = Helvetica, fontsize = 9]
+
+  # Entrées
+  df_metadata      [label = 'df_metadata\\n(wide format)', shape = cylinder, fillcolor = '#E8E8E8']
+  df_eq_indicator  [label = 'df_eq_indicator\\n(optionnel)', shape = cylinder, fillcolor = '#E8E8E8']
+
+  # Étapes de traitement
+  wide_to_long     [label = 'wide_to_long()', fillcolor = '#CDE7F0']
+  decision         [label = 'df_eq_indicator\\nest NULL ?', shape = diamond, fillcolor = '#FFF2CC']
+  identify_hrc     [label = 'identify_hrc()', fillcolor = '#CDE7F0']
+  identify_hrc_eq  [label = 'identify_hrc_with_eq()\\n(+ warning si hrc_indicator ignoré)', fillcolor = '#CDE7F0']
+  split_clusters   [label = 'split_in_clusters()', fillcolor = '#CDE7F0']
+  create_edges     [label = 'create_edges()', fillcolor = '#CDE7F0']
+  grp_tab_names    [label = 'grp_tab_names()', fillcolor = '#CDE7F0']
+  grp_tab_cluster  [label = 'grp_tab_in_cluster()', fillcolor = '#CDE7F0']
+  tab_to_treat     [label = 'tab_to_treat()', fillcolor = '#CDE7F0']
+  dataframe_result [label = 'dataframe_result()', fillcolor = '#CDE7F0']
+
+  # Sortie
+  verbose_check    [label = 'verbose = TRUE ?', shape = diamond, fillcolor = '#FFF2CC']
+  out_verbose      [label = 'list(\\n  identify_hrc,\\n  info_var,\\n  split_in_clusters,\\n  create_edges,\\n  grp_tab_names,\\n  grp_tab_in_clusters,\\n  tab_to_treat,\\n  df_tab_to_treat\\n)', shape = note, fillcolor = '#D5F5D5']
+  out_simple       [label = 'dataframe_cluster_id\\n(tab_to_treat)', shape = note, fillcolor = '#D5F5D5']
+
+  # Forcer identify_hrc à gauche et identify_hrc_eq à droite, sur le même rang
+  { rank = same; identify_hrc; identify_hrc_eq }
+  identify_hrc -> identify_hrc_eq [style = invis]
+
+  # Flux
+  df_metadata -> wide_to_long
+  wide_to_long -> decision
+
+  decision -> identify_hrc     [label = 'oui']
+  decision -> identify_hrc_eq  [label = 'non']
+  df_eq_indicator -> identify_hrc_eq [style = dashed]
+
+  identify_hrc    -> split_clusters
+  identify_hrc_eq -> split_clusters
+
+  split_clusters -> create_edges
+  create_edges   -> grp_tab_names
+  grp_tab_names  -> grp_tab_cluster
+  split_clusters -> grp_tab_cluster [style = dashed, label = 'list_split']
+
+  grp_tab_cluster -> tab_to_treat
+  tab_to_treat    -> dataframe_result
+  identify_hrc    -> dataframe_result [style = dashed, label = 'list_hrc_identified']
+  identify_hrc_eq -> dataframe_result [style = dashed]
+
+  dataframe_result -> verbose_check
+  tab_to_treat     -> verbose_check   [style = dashed]
+
+  verbose_check -> out_verbose [label = 'TRUE']
+  verbose_check -> out_simple  [label = 'FALSE']
+}
+")
 ```
 
 ## Fonctions du bloc B
