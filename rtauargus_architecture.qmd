@@ -227,75 +227,78 @@ C'est une chaîne linéaire de sept étapes, chacune dans son propre fichier. C'
 sous-système le plus lisible du package, et le seul où le découpage
 « un fichier = une étape » est appliqué strictement.
 
-```{r}
-#| label: fig-analyse-metadata-flow
-#| fig-cap: "Pipeline de la fonction analyse_metadata()"
-#| echo: false
-#| warning: false
-#| fig-height: 10
+```{mermaid}
+%%| label: fig-analyse-metadata-flow
+%%| fig-cap: "Pipeline de la fonction analyse_metadata()"
+%%| echo: false
+%%| fig-height: 10
 
-library(DiagrammeR)
+flowchart TD
+    %% Entrées
+    df_metadata[("df_metadata<br/>(wide format)")]
+    df_eq_indicator[("df_eq_indicator<br/>(optionnel)")]
 
-grViz("
-digraph analyse_metadata {
+    %% Étapes de traitement
+    wide_to_long("wide_to_long()")
+    decision{"df_eq_indicator<br/>est NULL ?"}
+    identify_hrc("identify_hrc()")
+    identify_hrc_eq("identify_hrc_with_eq()<br/>(+ warning si hrc_indicator ignoré)")
+    split_clusters("split_in_clusters()")
+    create_edges("create_edges()")
+    grp_tab_names("grp_tab_names()")
+    grp_tab_cluster("grp_tab_in_cluster()")
+    tab_to_treat("tab_to_treat()")
+    dataframe_result("dataframe_result()")
 
-  graph [rankdir = TB, fontsize = 11, fontname = Helvetica]
-  node  [shape = box, style = 'rounded,filled', fontname = Helvetica, fontsize = 10]
-  edge  [fontname = Helvetica, fontsize = 9]
+    %% Sortie
+    verbose_check{"verbose = TRUE ?"}
+    out_verbose[/"list(<br/>  identify_hrc,<br/>  info_var,<br/>  split_in_clusters,<br/>  create_edges,<br/>  grp_tab_names,<br/>  grp_tab_in_clusters,<br/>  tab_to_treat,<br/>  df_tab_to_treat<br/>)"/]
+    out_simple[/"dataframe_cluster_id<br/>(tab_to_treat)"/]
 
-  # Entrées
-  df_metadata      [label = 'df_metadata\\n(wide format)', shape = cylinder, fillcolor = '#E8E8E8']
-  df_eq_indicator  [label = 'df_eq_indicator\\n(optionnel)', shape = cylinder, fillcolor = '#E8E8E8']
+    %% Forcer identify_hrc / identify_hrc_eq côte à côte
+    subgraph niveau_hrc [" "]
+        direction LR
+        identify_hrc ~~~ identify_hrc_eq
+    end
 
-  # Étapes de traitement
-  wide_to_long     [label = 'wide_to_long()', fillcolor = '#CDE7F0']
-  decision         [label = 'df_eq_indicator\\nest NULL ?', shape = diamond, fillcolor = '#FFF2CC']
-  identify_hrc     [label = 'identify_hrc()', fillcolor = '#CDE7F0']
-  identify_hrc_eq  [label = 'identify_hrc_with_eq()\\n(+ warning si hrc_indicator ignoré)', fillcolor = '#CDE7F0']
-  split_clusters   [label = 'split_in_clusters()', fillcolor = '#CDE7F0']
-  create_edges     [label = 'create_edges()', fillcolor = '#CDE7F0']
-  grp_tab_names    [label = 'grp_tab_names()', fillcolor = '#CDE7F0']
-  grp_tab_cluster  [label = 'grp_tab_in_cluster()', fillcolor = '#CDE7F0']
-  tab_to_treat     [label = 'tab_to_treat()', fillcolor = '#CDE7F0']
-  dataframe_result [label = 'dataframe_result()', fillcolor = '#CDE7F0']
+    %% Flux
+    df_metadata --> wide_to_long
+    wide_to_long --> decision
+    decision -->|oui| identify_hrc
+    decision -->|non| identify_hrc_eq
+    df_eq_indicator -.-> identify_hrc_eq
+    identify_hrc --> split_clusters
+    identify_hrc_eq --> split_clusters
+    split_clusters --> create_edges
+    create_edges --> grp_tab_names
+    grp_tab_names --> grp_tab_cluster
+    split_clusters -.->|list_split| grp_tab_cluster
+    grp_tab_cluster --> tab_to_treat
+    tab_to_treat --> dataframe_result
+    identify_hrc -.->|list_hrc_identified| dataframe_result
+    identify_hrc_eq -.-> dataframe_result
+    dataframe_result --> verbose_check
+    tab_to_treat -.-> verbose_check
+    verbose_check -->|TRUE| out_verbose
+    verbose_check -->|FALSE| out_simple
 
-  # Sortie
-  verbose_check    [label = 'verbose = TRUE ?', shape = diamond, fillcolor = '#FFF2CC']
-  out_verbose      [label = 'list(\\n  identify_hrc,\\n  info_var,\\n  split_in_clusters,\\n  create_edges,\\n  grp_tab_names,\\n  grp_tab_in_clusters,\\n  tab_to_treat,\\n  df_tab_to_treat\\n)', shape = note, fillcolor = '#D5F5D5']
-  out_simple       [label = 'dataframe_cluster_id\\n(tab_to_treat)', shape = note, fillcolor = '#D5F5D5']
-
-  # Forcer identify_hrc à gauche et identify_hrc_eq à droite, sur le même rang
-  { rank = same; identify_hrc; identify_hrc_eq }
-  identify_hrc -> identify_hrc_eq [style = invis]
-
-  # Flux
-  df_metadata -> wide_to_long
-  wide_to_long -> decision
-
-  decision -> identify_hrc     [label = 'oui']
-  decision -> identify_hrc_eq  [label = 'non']
-  df_eq_indicator -> identify_hrc_eq [style = dashed]
-
-  identify_hrc    -> split_clusters
-  identify_hrc_eq -> split_clusters
-
-  split_clusters -> create_edges
-  create_edges   -> grp_tab_names
-  grp_tab_names  -> grp_tab_cluster
-  split_clusters -> grp_tab_cluster [style = dashed, label = 'list_split']
-
-  grp_tab_cluster -> tab_to_treat
-  tab_to_treat    -> dataframe_result
-  identify_hrc    -> dataframe_result [style = dashed, label = 'list_hrc_identified']
-  identify_hrc_eq -> dataframe_result [style = dashed]
-
-  dataframe_result -> verbose_check
-  tab_to_treat     -> verbose_check   [style = dashed]
-
-  verbose_check -> out_verbose [label = 'TRUE']
-  verbose_check -> out_simple  [label = 'FALSE']
-}
-")
+    %% Styles
+    style df_metadata fill:#E8E8E8,stroke:#333
+    style df_eq_indicator fill:#E8E8E8,stroke:#333
+    style wide_to_long fill:#CDE7F0,stroke:#333
+    style decision fill:#FFF2CC,stroke:#333
+    style identify_hrc fill:#CDE7F0,stroke:#333
+    style identify_hrc_eq fill:#CDE7F0,stroke:#333
+    style split_clusters fill:#CDE7F0,stroke:#333
+    style create_edges fill:#CDE7F0,stroke:#333
+    style grp_tab_names fill:#CDE7F0,stroke:#333
+    style grp_tab_cluster fill:#CDE7F0,stroke:#333
+    style tab_to_treat fill:#CDE7F0,stroke:#333
+    style dataframe_result fill:#CDE7F0,stroke:#333
+    style verbose_check fill:#FFF2CC,stroke:#333
+    style out_verbose fill:#D5F5D5,stroke:#333
+    style out_simple fill:#D5F5D5,stroke:#333
+    style niveau_hrc fill:none,stroke:none
 ```
 
 ## Fonctions du bloc B
